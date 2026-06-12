@@ -1,44 +1,70 @@
 const { getSupabase } = require("./lib/supabase");
 
-const SLIMMPAY_BASE       = "https://api.slimmpay.com.br/v1";
-const SLIMMPAY_PUBLIC_KEY = process.env.SLIMMPAY_PUBLIC_KEY;
-const SLIMMPAY_SECRET_KEY = process.env.SLIMMPAY_SECRET_KEY;
+const PLAYPAY_BASE       = "https://app.playpayments.com.br/api";
+const PLAYPAY_SECRET_KEY = process.env.PLAYPAY_SECRET_KEY;
 
-const UTMIFY_PIXEL_ID = "6a2200f2ae65ba8b4e8c85c7";
-const UTMIFY_TOKEN    = "EAAakRBooZBQABRp8xaEz9T5H3YBvyq1JumM6Ie1LgCUQHERsBOBuo4ZA7WiVfnQ1hdmmpnM14JnsZC7tuAyHxCcEjwKnuGGiOlpL5PtZAovEWD72zPEtFhP49wewKXuhoXeQx5RKczdHZAyKr8Va7jrpk3MNMgT9XDT3hGv5KlnYq3ML2I57tyMrbOvtWugZDZD";
+const UTMIFY_TOKEN = "EAAakRBooZBQABRp8xaEz9T5H3YBvyq1JumM6Ie1LgCUQHERsBOBuo4ZA7WiVfnQ1hdmmpnM14JnsZC7tuAyHxCcEjwKnuGGiOlpL5PtZAovEWD72zPEtFhP49wewKXuhoXeQx5RKczdHZAyKr8Va7jrpk3MNMgT9XDT3hGv5KlnYq3ML2I57tyMrbOvtWugZDZD";
 
-function getAuthHeader() {
-  const token = Buffer.from(`${SLIMMPAY_PUBLIC_KEY}:${SLIMMPAY_SECRET_KEY}`).toString("base64");
-  return `Basic ${token}`;
-}
-
-async function sendUtmifyPurchase(txData, transactionId) {
+async function sendUtmifyOrder(txData, transactionId, paidAt) {
   try {
+    const amountCents     = Math.round((txData.amount || 37.20) * 100);
+    const gatewayFeeCents = Math.round(amountCents * 0.015); // ~1.5% estimado
+    const netCents        = amountCents - gatewayFeeCents;
+
     const payload = {
-      pixelId:  UTMIFY_PIXEL_ID,
-      orderId:  transactionId,
-      event:    "Purchase",
-      value:    txData.amount || 37.20,
-      currency: "BRL",
+      orderId:       transactionId,
+      platform:      "PlayPayments",
+      paymentMethod: "pix",
+      status:        "paid",
+      createdAt:     txData.created_at || new Date().toISOString().replace("T", " ").slice(0, 19),
+      approvedDate:  paidAt            || new Date().toISOString().replace("T", " ").slice(0, 19),
+      refundedAt:    null,
       customer: {
+        name:     txData.customer_name  || null,
         email:    txData.customer_email || null,
         phone:    txData.customer_phone || null,
-        name:     txData.customer_name  || null,
         document: txData.customer_cpf   || null,
+        country:  "BR",
+        ip:       null,
       },
+      products: [{
+        id:        "cnh-brasil-001",
+        name:      "Taxa CNH Brasil",
+        planId:    null,
+        planName:  null,
+        quantity:  1,
+        priceInCents: amountCents,
+      }],
+      trackingParameters: {
+        src:          null,
+        sck:          null,
+        utm_source:   txData.utm_source   || null,
+        utm_campaign: txData.utm_campaign || null,
+        utm_medium:   txData.utm_medium   || null,
+        utm_content:  txData.utm_content  || null,
+        utm_term:     txData.utm_term     || null,
+      },
+      commission: {
+        totalPriceInCents:    amountCents,
+        gatewayFeeInCents:    gatewayFeeCents,
+        userCommissionInCents: netCents,
+        currency:             "BRL",
+      },
+      isTest: false,
     };
-    const resp = await fetch("https://tracking.utmify.com.br/tracking/v1", {
+
+    const resp = await fetch("https://api.utmify.com.br/api-credentials/orders", {
       method:  "POST",
       headers: {
-        "Content-Type":  "application/json",
-        "Authorization": `Bearer ${UTMIFY_TOKEN}`,
+        "Content-Type": "application/json",
+        "x-api-token":  UTMIFY_TOKEN,
       },
       body: JSON.stringify(payload),
     });
     const text = await resp.text();
-    console.log(`[UTMify] Purchase enviado - status ${resp.status}: ${text}`);
+    console.log(`[UTMify] Order enviado - status ${resp.status}: ${text}`);
   } catch (err) {
-    console.error("[UTMify] Erro ao enviar Purchase:", err);
+    console.error("[UTMify] Erro ao enviar order:", err);
   }
 }
 
@@ -71,8 +97,8 @@ exports.handler = async (event) => {
   let transactionId = event.queryStringParameters?.id || event.queryStringParameters?.transactionId;
   if (event.httpMethod === "POST") {
     try {
-      const body = event.body ? JSON.parse(event.body) : {};
-      transactionId = body?.transactionId || body?.id || transactionId;
+      const b = event.body ? JSON.parse(event.body) : {};
+      transactionId = b?.transactionId || b?.id || transactionId;
     } catch {}
   }
 
@@ -86,11 +112,10 @@ exports.handler = async (event) => {
   let statusResp;
   let text = "";
   try {
-    statusResp = await fetch(`${SLIMMPAY_BASE}/payment-transaction/info/${encodeURIComponent(transactionId)}`, {
+    statusResp = await fetch(`${PLAYPAY_BASE}/pix/${encodeURIComponent(transactionId)}`, {
       method:  "GET",
       headers: {
-        "accept":        "application/json",
-        "authorization": getAuthHeader(),
+        "Authorization": `Bearer ${PLAYPAY_SECRET_KEY}`,
       },
       signal: controller.signal,
     });
@@ -105,7 +130,6 @@ exports.handler = async (event) => {
   let data = {};
   try {
     data = JSON.parse(text);
-    data = data.data || data;
   } catch {
     data = {};
   }
@@ -114,11 +138,11 @@ exports.handler = async (event) => {
     return jsonResponse(statusResp.status, { success: false, error: text || "Erro ao consultar pagamento" });
   }
 
-  // Slimmpay retorna Status: "PENDING" | "PAID" | "CANCELLED" etc.
-  const rawStatus = (data.Status || data.status || "pending").toLowerCase();
-  const paid      = rawStatus === "paid" || rawStatus === "completed" || rawStatus === "aprovado" || rawStatus === "concluido";
+  // PlayPayments status: pending | paid | cancelled | expired
+  const rawStatus = (data.status || "pending").toLowerCase();
+  const paid      = rawStatus === "paid";
   const status    = paid ? "paid" : rawStatus;
-  const paidAt    = data.PaidAt || data.paid_at || data.confirmed_at || null;
+  const paidAt    = data.paid_at || null;
 
   try {
     const supabase = getSupabase();
@@ -126,7 +150,7 @@ exports.handler = async (event) => {
     if (paid) {
       const { data: txData } = await supabase
         .from("transactions")
-        .select("status, customer_name, customer_email, customer_phone, customer_cpf, amount")
+        .select("status, customer_name, customer_email, customer_phone, customer_cpf, amount, created_at, utm_source, utm_campaign, utm_medium, utm_content, utm_term")
         .eq("transaction_id", transactionId)
         .single();
 
@@ -138,12 +162,12 @@ exports.handler = async (event) => {
         .eq("transaction_id", transactionId);
 
       if (!alreadyPaid && txData) {
-        await sendUtmifyPurchase(txData, transactionId);
+        await sendUtmifyOrder(txData, transactionId, paidAt);
       }
     } else {
       await supabase
         .from("transactions")
-        .update({ status, paid_at: null })
+        .update({ status })
         .eq("transaction_id", transactionId);
     }
   } catch (_) {}

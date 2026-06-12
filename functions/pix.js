@@ -1,13 +1,7 @@
 const { getSupabase } = require("./lib/supabase");
 
-const SLIMMPAY_BASE       = "https://api.slimmpay.com.br/v1";
-const SLIMMPAY_PUBLIC_KEY = process.env.SLIMMPAY_PUBLIC_KEY;
-const SLIMMPAY_SECRET_KEY = process.env.SLIMMPAY_SECRET_KEY;
-
-function getAuthHeader() {
-  const token = Buffer.from(`${SLIMMPAY_PUBLIC_KEY}:${SLIMMPAY_SECRET_KEY}`).toString("base64");
-  return `Basic ${token}`;
-}
+const PLAYPAY_BASE       = "https://app.playpayments.com.br/api";
+const PLAYPAY_SECRET_KEY = process.env.PLAYPAY_SECRET_KEY;
 
 function jsonResponse(statusCode, body) {
   return {
@@ -23,19 +17,19 @@ function jsonResponse(statusCode, body) {
 }
 
 function normalizeAmount(rawAmount) {
-  if (rawAmount == null) return { amountReais: 37.20 };
+  if (rawAmount == null) return 37.20;
   if (typeof rawAmount === "string") {
     const cleaned = rawAmount.replace(/[^\d,.-]/g, "").replace(",", ".");
     const n = parseFloat(cleaned);
-    if (!Number.isFinite(n)) return { amountReais: 37.20 };
-    // Se vier em centavos (ex: 3720), converte
-    if (Number.isInteger(n) && n >= 100) return { amountReais: n / 100 };
-    return { amountReais: n };
+    if (!Number.isFinite(n)) return 37.20;
+    // Se vier em centavos (ex: 3720), converte para reais
+    if (Number.isInteger(n) && n >= 100) return n / 100;
+    return n;
   }
   const n = Number(rawAmount);
-  if (!Number.isFinite(n)) return { amountReais: 37.20 };
-  if (Number.isInteger(n) && n >= 100) return { amountReais: n / 100 };
-  return { amountReais: n };
+  if (!Number.isFinite(n)) return 37.20;
+  if (Number.isInteger(n) && n >= 100) return n / 100;
+  return n;
 }
 
 async function postWithRetry(url, payload, headers) {
@@ -87,8 +81,8 @@ exports.handler = async (event) => {
   const randDigits = (len) => Array.from({ length: len }, () => Math.floor(Math.random() * 10)).join("");
   const randId = randDigits(6);
 
-  const rawAmount = body.amount ?? body.valor ?? body.total ?? 37.20;
-  const { amountReais } = normalizeAmount(rawAmount);
+  const rawAmount   = body.amount ?? body.valor ?? body.total ?? 37.20;
+  const amountReais = normalizeAmount(rawAmount);
 
   const customerName  = (body.nome || body.name || body.customer_name || `Cliente ${randId}`).toString().trim();
   const customerEmail = (body.email || body.customer_email || `cliente${randId}@example.com`).toString().trim();
@@ -96,36 +90,28 @@ exports.handler = async (event) => {
   const cpfRaw        = (body.cpf || body.document || body.customer_cpf || randDigits(11)).toString().replace(/\D/g, "");
   const customerCpf   = cpfRaw.padEnd(11, "0").slice(0, 11);
 
-  const externalId = `${randId}-${Date.now()}`;
-
-  const amountCents = Math.round(amountReais * 100);
+  const externalId = `pedido-${randId}-${Date.now()}`;
 
   const payload = {
-    payment_method: "pix",
-    amount: amountCents,
+    amount:      amountReais,
     external_id: externalId,
-    items: [{ title: "Livro Falante", quantity: 1, unit_price: amountCents }],
-    metadata: { order: externalId },
+    expires_in:  3600,
     customer: {
-      name:  customerName,
-      email: customerEmail,
-      phone: customerPhone,
-      document: {
-        type:   "cpf",
-        number: customerCpf,
-      },
+      name:     customerName,
+      email:    customerEmail,
+      document: customerCpf,
+      phone:    customerPhone,
     },
   };
 
   const headers = {
     "Content-Type":  "application/json",
-    "accept":        "application/json",
-    "authorization": getAuthHeader(),
+    "Authorization": `Bearer ${PLAYPAY_SECRET_KEY}`,
   };
 
   let resp;
   try {
-    resp = await postWithRetry(`${SLIMMPAY_BASE}/payment-transaction/create`, payload, headers);
+    resp = await postWithRetry(`${PLAYPAY_BASE}/pix`, payload, headers);
   } catch (err) {
     return jsonResponse(502, { success: false, error: "Falha ao conectar com gateway: " + String(err) });
   }
@@ -135,19 +121,17 @@ exports.handler = async (event) => {
     return jsonResponse(resp.status, { success: false, error: text || "Erro ao criar cobrança PIX", raw: text });
   }
 
-  let parsed = {};
+  let data = {};
   try {
-    parsed = JSON.parse(text);
+    data = JSON.parse(text);
   } catch {
     return jsonResponse(500, { success: false, error: "Resposta inválida da gateway", raw: text });
   }
 
-  const data = parsed.data || parsed;
-
-  // Campos retornados pelo Slimmpay
-  const transactionId = data.id   || data.Id   || data.transaction_id || null;
-  const pixCode       = data.pix?.qr_code || data.pix_code || data.brcode || data.qr_code || data.payload || null;
-  const qrCodeImage   = data.pix?.qr_code_base64 || data.qr_code_base64 || data.qrCodeBase64 || null;
+  // PlayPayments retorna: transaction_id, pix_code, qr_code, status
+  const transactionId = data.transaction_id || data.id || null;
+  const pixCode       = data.pix_code || data.brcode || data.copy_paste || null;
+  const qrCodeImage   = data.qr_code || data.qr_code_base64 || null;
 
   try {
     const supabase = getSupabase();
@@ -158,7 +142,7 @@ exports.handler = async (event) => {
       customer_email: customerEmail,
       customer_cpf:   customerCpf,
       customer_phone: customerPhone,
-      status:         "PENDING",
+      status:         "pending",
       brcode:         pixCode,
     });
   } catch (_) {}
@@ -173,6 +157,6 @@ exports.handler = async (event) => {
     transaction_id: transactionId,
     transactionId,
     deposit_id:     transactionId,
-    status:         data.Status || data.status || "PENDING",
+    status:         data.status || "pending",
   });
 };
